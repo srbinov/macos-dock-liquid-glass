@@ -1,0 +1,19 @@
+{
+  "description": "Tahoe liquid-glass copy of macOS Dock 2026 peachOS. Turn the other dock off before enabling this one.",
+  "name": "macOS Dock Liquid Glass",
+  "original-authors": [
+    "icedman"
+  ],
+  "shell-version": [
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "url": "https://github.com/icedman/dash2dock-lite",
+  "uuid": "macos-dock-liquid-glass@peachos",
+  "schema-id": "org.gnome.shell.extensions.macos-dock",
+  "gettext-domain": "macos-dock-2026-peachos",
+  "version": 100
+}

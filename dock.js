@@ -1,0 +1,2182 @@
+'use strict';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Fav from 'resource:///org/gnome/shell/ui/appFavorites.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+
+import Shell from 'gi://Shell';
+import GObject from 'gi://GObject';
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import Clutter from 'gi://Clutter';
+import Graphene from 'gi://Graphene';
+import St from 'gi://St';
+
+import { Dash } from 'resource:///org/gnome/shell/ui/dash.js';
+
+import { TintEffect } from './effects/tint_effect.js';
+import { MonochromeEffect } from './effects/monochrome_effect.js';
+
+import { DockIcon, DockItemContainer, DockBackground } from './dockItems.js';
+import { DockItemList } from './dockItemMenu.js';
+import { AutoHide } from './autohide.js';
+import { Animator } from './animator.js';
+import { GlassBlur } from './glassBlur.js';
+import {
+  iconSizeFromScale,
+  iconSpacedSize,
+  extraIconsVisible,
+} from './iconMetrics.js';
+import {
+  get_distance_sqr,
+  get_distance,
+  isInRect,
+  isOverlapRect,
+  tempPath,
+} from './utils.js';
+
+const Point = Graphene.Point;
+
+export const DockPosition = {
+  BOTTOM: 'bottom',
+  LEFT: 'left',
+  RIGHT: 'right',
+  TOP: 'top',
+};
+
+export const DockAlignment = {
+  CENTER: 'center',
+  START: 'start',
+  END: 'end',
+};
+
+const PREVIEW_FRAMES = 64;
+const ANIM_DEBOUNCE_END_DELAY = 750;
+
+// Extra unscaled px of gap a user-created separator opens up between the icons
+// on either side of it (matches the feel of the built-in "apps | Downloads" one).
+export const SEP_GAP = 18;
+
+const MIN_SCROLL_RESOLUTION = 4;
+const MAX_SCROLL_RESOLUTION = 10;
+
+export let Dock = GObject.registerClass(
+  { GTypeName: 'PeachLiquidGlassDock' },
+  class DashToDock extends St.Widget {
+    _init(params) {
+      super._init({
+        // name: 'd2daDock',
+        name: 'dashtodockContainer',
+        style_class: 'bottom',
+        reactive: false,
+        track_hover: false,
+        width: 0,
+        height: 0,
+        clip_to_allocation: true,
+        x_align: Clutter.ActorAlign.CENTER,
+        y_align: Clutter.ActorAlign.CENTER,
+        offscreen_redirect: Clutter.OffscreenRedirect.ALWAYS,
+      });
+
+      this.extension = params.extension;
+
+      this._alignment = DockAlignment.CENTER;
+      this._monitorIndex = Main.layoutManager.primaryIndex;
+
+      // own backdrop blur, painted under the tinted pill
+      this._glassBlur = new GlassBlur();
+      this.add_child(this._glassBlur.actor);
+      this._background = new DockBackground({ name: 'd2daBackground' });
+      this.add_child(this._background);
+      this.add_child(this._glassBlur.rim);
+
+      // for blur-my-shell
+      this._slider = {
+        get_child: () => {
+          return this;
+        },
+        get_parent: () => {
+          return this;
+        },
+      };
+
+      // pretend to be Dash-to-Dock
+      // required by blur-my-shell to find the dash upon disabling
+      this.fake_dash = new St.Widget({ name: 'dash' });
+      this.add_child(this.fake_dash);
+      this.fake_dash_background = new St.Widget({
+        style_class: 'dash-background',
+      });
+      this.fake_dash.add_child(this.fake_dash_background);
+      this.fake_dash._background = this.fake_dash_background;
+      this.fake_dash.visible = false;
+
+      this.renderArea = new St.Widget({
+        name: 'DockRenderArea',
+        offscreen_redirect: Clutter.OffscreenRedirect.ALWAYS,
+        reactive: false,
+        track_hover: false,
+      });
+      this.renderArea.opacity = 0;
+      this.add_child(this.renderArea);
+
+      this.add_child(this.createDash());
+      this._scrollCounter = 0;
+
+      this.animator = new Animator();
+      this.animator.dock = this;
+      this.animator.extension = this.extension;
+      this.animator.enable();
+
+      this.autohider = new AutoHide();
+      this.autohider.dock = this;
+      this.autohider.extension = this.extension;
+      if (this.extension.autohide_dash) {
+        this.autohider.enable();
+      }
+
+      this.struts = new St.Widget({
+        name: 'DockStruts',
+        offscreen_redirect: Clutter.OffscreenRedirect.ALWAYS,
+      });
+      this.dwell = new St.Widget({
+        name: 'DockDwell',
+        reactive: true,
+        track_hover: true,
+        offscreen_redirect: Clutter.OffscreenRedirect.ALWAYS,
+      });
+      this.dwell.connectObject(
+        'motion-event',
+        this.autohider._onMotionEvent.bind(this.autohider),
+        'enter-event',
+        this.autohider._onEnterEvent.bind(this.autohider),
+        'leave-event',
+        this.autohider._onLeaveEvent.bind(this.autohider),
+        this
+      );
+    }
+
+    destroyDash() {
+      if (this.dash) {
+        {
+          this._icons = null;
+          this._findIcons();
+          this._icons.forEach((i) => {
+            this._cleanupIcon(i);
+          });
+          this._icons = null;
+        }
+
+        this.remove_child(this.dash);
+        this.dash = null;
+        this._trashIcon = null;
+        this._recentFilesIcon = null;
+        this._downloadsIcon = null;
+        // mounted icons?
+      }
+    }
+
+    recreateDash() {
+      this._hidden = false;
+      this.opacity = 0;
+      this.renderArea.opacity = 0;
+      this.add_child(this.createDash());
+      this._icons = null;
+      this._trashIcon = null;
+      this._recentFilesIcon = null;
+      this._downloadsIcon = null;
+      this._beginAnimation();
+    }
+
+    createItem(appinfo_filename) {
+      let item = new DockItemContainer({
+        appinfo_filename,
+      });
+      item.dock = this;
+      item._menu._onActivate = () => {
+        this._maybeBounce(item);
+      };
+      this._extraIcons.add_child(item);
+      return item;
+    }
+
+    dock() {
+      if (!this.dash) {
+        this.add_child(this.createDash());
+      }
+      this.animator.enable();
+      this.addToChrome();
+      this.layout();
+      this._beginAnimation();
+    }
+
+    undock() {
+      this._endSeparatorDrag();
+      if (this._sepMenu) {
+        try {
+          this._sepMenu.destroy();
+        } catch (e) {}
+        this._sepMenu = null;
+      }
+      this._destroyList();
+      this._endAnimation();
+      this.dash._box.remove_effect_by_name('icon-effect');
+      this.autohider.disable();
+      this.removeFromChrome();
+      this.animator.disable();
+      this._glassBlur?.destroy();
+      this._glassBlur = null;
+    }
+
+    _onButtonPressEvent(obj, evt) {
+      // Signal handler is called (actor, event) -- see _onScrollEvent(obj, evt).
+      // Separator interactions: the reactive ghost dash sits above renderArea, so
+      // the separator overlays can't get events themselves -- hit-test here.
+      try {
+        if (!evt || !evt.get_coords) return Clutter.EVENT_PROPAGATE;
+        let [x, y] = evt.get_coords();
+        let button = evt.get_button ? evt.get_button() : 1;
+
+        let builtin = (this._separators || [])
+          .map((a) => ({ marker: a, isBuiltin: true, overlay: a._overlay }))
+          .filter((h) => h.overlay && h.overlay.visible);
+        let user = (this._userSeparators || [])
+          .map((m) => ({ marker: m, isBuiltin: false, overlay: m._overlay }))
+          .filter((h) => h.overlay && h.overlay.visible);
+
+        for (let h of [...user, ...builtin]) {
+          let r = this._separatorScreenRect(h.overlay);
+          if (!r) continue;
+          if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+            if (button === 3) {
+              this._openSeparatorMenu(h);
+              return Clutter.EVENT_STOP;
+            }
+            if (button === 1 && !h.isBuiltin) {
+              this._beginSeparatorDrag(h.marker);
+              return Clutter.EVENT_STOP;
+            }
+          }
+        }
+      } catch (err) {
+        console.log(err);
+      }
+      return Clutter.EVENT_PROPAGATE;
+    }
+
+    // Screen-space rect of a separator overlay, padded out to a comfortable
+    // click/grab target (the visible line is only ~1px wide).
+    _separatorScreenRect(overlay) {
+      if (!overlay) return null;
+      let [ox, oy] = this.renderArea.get_transformed_position();
+      let padX = 9;
+      let padY = 6;
+      return {
+        x: ox + overlay.x - padX,
+        y: oy + overlay.y - padY,
+        w: overlay.width + padX * 2,
+        h: overlay.height + padY * 2,
+      };
+    }
+
+    _openSeparatorMenu(h) {
+      if (this._sepMenu) {
+        this._sepMenu.destroy();
+        this._sepMenu = null;
+      }
+      if (!this._sepMenuManager) {
+        this._sepMenuManager = new PopupMenu.PopupMenuManager(this);
+      }
+
+      // anchor the popup at the separator via the shared dummy cursor
+      let r = this._separatorScreenRect(h.overlay);
+      if (r) {
+        Main.layoutManager.setDummyCursorGeometry(
+          r.x + r.w / 2,
+          r.y + r.h / 2,
+          0,
+          0
+        );
+      }
+
+      let menu = new PopupMenu.PopupMenu(
+        Main.layoutManager.dummyCursor,
+        0.5,
+        this._position === DockPosition.BOTTOM ? St.Side.BOTTOM : St.Side.TOP
+      );
+      Main.uiGroup.add_child(menu.actor);
+      menu.actor.hide();
+      this._sepMenuManager.addMenu(menu);
+
+      // anchor icon = the one just left of this separator
+      let anchorIcon = this._iconIdentity(h.marker._prev);
+
+      menu.addAction('Add separator', () =>
+        this.addSeparatorNear(anchorIcon, h.isBuiltin)
+      );
+      if (!h.isBuiltin) {
+        menu.addAction('Delete separator', () =>
+          this.removeSeparator(h.marker.id)
+        );
+      }
+
+      this._sepMenu = menu;
+      menu.open(BoxPointer.PopupAnimation.FULL);
+    }
+
+    _beginSeparatorDrag(marker) {
+      if (this._draggedUserSep || !marker) return;
+      this._draggedUserSep = marker;
+      marker._dragX = null;
+      marker._dragAfter = marker.after || '';
+      // kick the animator so magnification eases back down right away
+      this._beginAnimation();
+      let [ox] = this.renderArea.get_transformed_position();
+
+      this._sepDragCapturedId = global.stage.connect(
+        'captured-event',
+        (a, event) => {
+          let t = event.type();
+          if (
+            t === Clutter.EventType.MOTION ||
+            t === Clutter.EventType.TOUCH_UPDATE
+          ) {
+            let [px] = global.get_pointer();
+            let g = this._nearestValidGapIdentity(px, marker.id);
+            if (g) {
+              marker._dragAfter = g.id;
+              // magnetically snap the overlay to the target gap centre
+              marker._dragX = g.x - ox;
+            } else {
+              marker._dragX = px - ox;
+            }
+            this._beginAnimation();
+            return Clutter.EVENT_STOP;
+          }
+          if (
+            t === Clutter.EventType.BUTTON_RELEASE ||
+            t === Clutter.EventType.TOUCH_END
+          ) {
+            this._endSeparatorDrag();
+            return Clutter.EVENT_STOP;
+          }
+          if (
+            t === Clutter.EventType.KEY_PRESS &&
+            event.get_key_symbol() === Clutter.KEY_Escape
+          ) {
+            // cancel: keep the original anchor
+            if (this._draggedUserSep) this._draggedUserSep._dragAfter = null;
+            this._endSeparatorDrag();
+            return Clutter.EVENT_STOP;
+          }
+          return Clutter.EVENT_PROPAGATE;
+        }
+      );
+    }
+
+    _endSeparatorDrag() {
+      if (this._sepDragCapturedId) {
+        global.stage.disconnect(this._sepDragCapturedId);
+        this._sepDragCapturedId = 0;
+      }
+      let marker = this._draggedUserSep;
+      this._draggedUserSep = null;
+      if (marker) marker._dragX = null;
+      if (!marker) return;
+      let after =
+        marker._dragAfter != null ? marker._dragAfter : marker.after || '';
+      if (after === (marker.after || '')) {
+        // nothing changed -- just re-render to drop the drag visuals
+        this._icons = null;
+        this._beginAnimation();
+        return;
+      }
+      let list = this.extension.customSeparators.map((s) =>
+        s.id === marker.id ? { ...s, after } : s
+      );
+      this.extension.setCustomSeparators(list); // -> refresh via change dispatch
+    }
+
+    // App-icon identities in visual (left-to-right) order.
+    _orderedIconIds() {
+      return (this._dashItems || [])
+        .filter((it) => it._icon && !it._userSeparator)
+        .map((it) => this._iconIdentity(it));
+    }
+
+    // Would a separator anchored `after afterId` be legal? Illegal if it would
+    // sit directly next to another separator (built-in or user) with no icon
+    // between them, or float at an edge with nothing on either side.
+    // `excludeSepId` drops that user separator from the check (for drag).
+    _gapIsValid(afterId, excludeSepId = null) {
+      let kindOf = (it) =>
+        it._userSeparator || it._cls === 'dash-separator'
+          ? 'sep'
+          : it._icon
+            ? 'icon'
+            : 'other';
+      let seq = (this._dashItems || []).filter(
+        (it) => !(it._userSeparator && it.id === excludeSepId)
+      );
+
+      let idx;
+      if (!afterId) {
+        idx = 0;
+      } else {
+        let ai = seq.findIndex(
+          (it) => kindOf(it) === 'icon' && this._iconIdentity(it) === afterId
+        );
+        if (ai < 0) return false;
+        idx = ai + 1;
+      }
+
+      let leftKind = idx > 0 ? kindOf(seq[idx - 1]) : 'edge';
+      let rightKind = idx < seq.length ? kindOf(seq[idx]) : 'edge';
+      if (leftKind === 'sep' || rightKind === 'sep') return false;
+      if (leftKind === 'edge' && rightKind === 'edge') return false;
+      return true;
+    }
+
+    // Nearest gap (by pointer X) that _gapIsValid accepts -- null if none.
+    _nearestValidGapIdentity(px, excludeSepId) {
+      let icons = (this._icons || []).filter(
+        (c) => c._renderer && c._renderer.visible
+      );
+      if (!icons.length) return null;
+      let [ox] = this.renderArea.get_transformed_position();
+
+      let gaps = [{ id: '', x: ox + icons[0]._renderer.x }];
+      icons.forEach((c, i) => {
+        let rr = c._renderer;
+        let right = ox + rr.x + rr.width * (rr.scaleX || 1);
+        let gx =
+          i < icons.length - 1
+            ? (right + ox + icons[i + 1]._renderer.x) / 2
+            : right;
+        gaps.push({ id: this._iconIdentity(c), x: gx });
+      });
+
+      let valid = gaps.filter((g) => this._gapIsValid(g.id, excludeSepId));
+      if (!valid.length) return null;
+      valid.sort((a, b) => Math.abs(px - a.x) - Math.abs(px - b.x));
+      return valid[0]; // { id, x }  (x is screen-space)
+    }
+
+    _onMotionEvent(evt) {
+      if (!this._monitor.inFullscreen) {
+        this._beginAnimation();
+      }
+      this.autohider._debounceCheckHide();
+      return Clutter.EVENT_PROPAGATE;
+    }
+    _onEnterEvent(evt) {
+      if (!this._monitor.inFullscreen) {
+        this._beginAnimation();
+      }
+      return Clutter.EVENT_PROPAGATE;
+    }
+    _onLeaveEvent(evt) {
+      this.autohider._debounceCheckHide();
+      this._debounceEndAnimation();
+      return Clutter.EVENT_PROPAGATE;
+    }
+
+    _debouncedBeginAnimation() {
+      this.dash.opacity = 1;
+
+      // this elaborate hack - mitigates nvim's "create window when deleting! hmmp"
+      if (!this._debounceBeginAnimateSeq) {
+        this._debounceBeginAnimateSeq = this.extension._loTimer.runDebounced(
+          () => {
+            this._beginAnimation();
+            this.autohider._debounceCheckHide();
+          },
+          400,
+          'debounceBeginAnimate'
+        );
+      } else {
+        this.extension._loTimer.runDebounced(this._debounceBeginAnimateSeq);
+      }
+    }
+
+    _onFocusWindow(evt) {
+      // this._debouncedBeginAnimation();
+      this._beginAnimation();
+      this.autohider._debounceCheckHide();
+      return Clutter.EVENT_PROPAGATE;
+    }
+    _onFullScreen() {
+      // this._debouncedBeginAnimation();
+      this._beginAnimation();
+      this.autohider._debounceCheckHide();
+      return Clutter.EVENT_PROPAGATE;
+    }
+    _onRestacked() {
+      // this._debouncedBeginAnimation();
+      this._beginAnimation();
+      this.autohider._debounceCheckHide();
+      return Clutter.EVENT_PROPAGATE;
+    }
+    _onAppsChanged(evt) {
+      this._favorite_ids = Fav.getAppFavorites()._getIds();
+      this._icons = null;
+      this._fast_forward = 20;
+      // this._debouncedBeginAnimation();
+      this._beginAnimation();
+      this.autohider._debounceCheckHide();
+      return Clutter.EVENT_PROPAGATE;
+    }
+    _onClock() {
+      this._clock?.redraw();
+    }
+    _onCalendar() {
+      this._calendar?.redraw();
+    }
+
+    _createEffect(idx) {
+      let effect = null;
+      switch (idx) {
+        case 1: {
+          effect = new TintEffect({
+            name: 'color',
+            color: this.extension.icon_effect_color,
+          });
+          effect.preload(this.extension.path);
+          break;
+        }
+        case 2: {
+          effect = new MonochromeEffect({
+            name: 'color',
+            color: this.extension.icon_effect_color,
+          });
+          effect.preload(this.extension.path);
+          break;
+        }
+      }
+      return effect;
+    }
+
+    _effectTargets() {
+      return [this.renderArea, this._list?._box];
+    }
+
+    _updateIconEffect() {
+      let targets = this._effectTargets();
+      targets.forEach((target) => {
+        if (!target) return;
+        target.remove_effect_by_name('icon-effect');
+        let effect = this._createEffect(this.extension.icon_effect);
+        if (effect) {
+          effect.color = this.extension.icon_effect_color;
+          target.add_effect_with_name('icon-effect', effect);
+        }
+        target.iconEffect = effect;
+      });
+    }
+
+    _updateIconEffectColor(color) {
+      let targets = this._effectTargets();
+      targets.forEach((target) => {
+        try {
+          if (target && target.iconEffect) {
+            target.iconEffect.color = color;
+          }
+        } catch(err) {
+          // console.log(err)
+        }
+      });
+    }
+
+    slideIn() {
+      if (this._hidden) {
+        this._hidden = false;
+        this._beginAnimation();
+      }
+    }
+
+    slideOut() {
+      if (this._list && this._list.visible) {
+        return;
+      }
+      if (!this._hidden) {
+        this._hidden = true;
+        this._beginAnimation();
+      }
+    }
+
+    getMonitor() {
+      this._monitorIndex = this.extension._queryDisplay(this._monitorIndex);
+      let m =
+        Main.layoutManager.monitors[this._monitorIndex] ||
+        Main.layoutManager.primaryMonitor;
+      this._monitor = m;
+      return m;
+    }
+
+    createDash() {
+      this._pauseAllBounce(1500);
+      if (this.dash) {
+        this.destroyDash();
+      }
+
+      this.Dash = Dash;
+      let dash = new Dash();
+
+      dash._adjustIconSize = () => {};
+      let con = console;
+      let orig = dash._createAppItem;
+      orig = orig.bind(dash);
+      dash._createAppItem = function (app) {
+        let item = orig.call(this, app);
+        this.opacity = 0;
+        item.child.visible = false;
+        return item;
+      };
+
+      this.dash = dash;
+      this.dash._background.visible = false;
+      this.dash._box.clip_to_allocation = false;
+
+      this._extraIcons = new St.BoxLayout();
+      this.dash._box.add_child(this._extraIcons);
+
+      // null these - needed when calling recreateDash
+      this._trashIcon = null;
+
+      this._separator = new St.Widget({
+        style_class: 'dash-separator',
+        y_align: Clutter.ActorAlign.CENTER,
+        height: 48,
+      });
+      this._separator.name = 'separator';
+      this._extraIcons.add_child(this._separator);
+
+      this.dash.reactive = true;
+      this.dash.track_hover = true;
+      this.dash.connectObject(
+        'scroll-event',
+        this._onScrollEvent.bind(this),
+        'button-press-event',
+        this._onButtonPressEvent.bind(this),
+        'motion-event',
+        this._onMotionEvent.bind(this),
+        'enter-event',
+        this._onEnterEvent.bind(this),
+        'leave-event',
+        this._onLeaveEvent.bind(this),
+        'destroy',
+        () => {},
+        this
+      );
+
+      this.dash.opacity = 0;
+      return dash;
+    }
+
+    addToChrome() {
+      if (this._onChrome) {
+        return;
+      }
+
+      this._updateIconEffect();
+
+      Main.layoutManager.addChrome(this.struts, {
+        affectsStruts: !this.extension.autohide_dash,
+        ...(Config.PACKAGE_VERSION[0] == '4'
+          ? { affectsInputRegion: true }
+          : {}),
+        trackFullscreen: false,
+      });
+
+      Main.layoutManager.addChrome(this, {
+        affectsStruts: false,
+        // affectsInputRegion: false,
+        trackFullscreen: true,
+      });
+
+      Main.layoutManager.addChrome(this.dwell, {
+        affectsStruts: false,
+        // affectsInputRegion: false,
+        trackFullscreen: false,
+      });
+
+      this._onChrome = true;
+    }
+
+    removeFromChrome() {
+      if (!this._onChrome) {
+        return;
+      }
+      Main.layoutManager.removeChrome(this.struts);
+      Main.layoutManager.removeChrome(this);
+      Main.layoutManager.removeChrome(this.dwell);
+      this._onChrome = false;
+      this.dash._box.get_parent().remove_effect_by_name('icon-effect');
+    }
+
+    isVertical() {
+      return (
+        this._position == DockPosition.LEFT ||
+        this._position == DockPosition.RIGHT
+      );
+    }
+
+    _preferredIconSize() {
+      let upscale = 1 + (2 - this._scaleFactor) || 1;
+      if (upscale < 1) {
+        upscale = 1;
+      }
+      let iconSize = upscale * iconSizeFromScale(this.extension.icon_size);
+      iconSize *= this.extension.scale;
+
+      if (this.extension._config.icon_size) {
+        iconSize = this.extension._config.icon_size;
+      }
+
+      this._iconSize = iconSize;
+      return iconSize;
+    }
+
+    // Structure for dash icon container widgets - g42,g43,g44,g45,g46
+    /**
+     *  DashItemContainer
+     *    > child (DashIcon[appwell])
+     *      > .icon (IconGrid)
+     *        > .icon (StIcon)
+     *      > ._dot
+     *    > .label
+     *
+     *  ShowAppsIcon extends DashItemContainer
+     *    > .icon (IconGrid)
+     *      > .icon
+     *    > ._iconActor
+     */
+
+    // Helper: robustly get the StIcon from a DashIcon/AppIcon instance
+    // Supports both GNOME 46 (old) and GNOME 50 (new) structures
+    _getStIconFromAppwell(appwell) {
+      if (!appwell || !appwell.icon) return null;
+      let baseIcon = appwell.icon; // BaseIcon or old IconGrid
+
+      if (baseIcon instanceof St.Icon) return baseIcon;
+
+      // Try direct .icon property (works after setIconSize is called)
+      if (baseIcon.icon) return baseIcon.icon;
+      // GNOME 50: try _iconBin.child
+      if (baseIcon._iconBin && baseIcon._iconBin.child) return baseIcon._iconBin.child;
+      // Force icon creation if not yet initialized
+      try {
+        if (baseIcon.setIconSize) {
+          let size = (typeof baseIcon.iconSize === 'number' && baseIcon.iconSize > 0) ? baseIcon.iconSize : 48;
+          baseIcon._createIconTexture(size);
+          if (baseIcon.icon) return baseIcon.icon;
+          if (baseIcon._iconBin && baseIcon._iconBin.child) return baseIcon._iconBin.child;
+        }
+      } catch (err) {
+        // ignore initialization errors
+      }
+      return null;
+    }
+    
+    _inspectIcon(c) {
+      if (!c.visible) return false;
+
+      /* release any reference once destroyed */
+      if (!c._destroyConnectId) {
+        c._destroyConnectId = c.connect('destroy', () => {
+          this._icons = null;
+          c._label = null;
+          c._icon = null;
+          c._appwell = null;
+        });
+      }
+
+      /* separator */
+      c._cls = c._cls || c.get_style_class_name();
+      if (c._cls === 'dash-separator') {
+        this._separators.push(c);
+        this._dashItems.push(c);
+        c.visible = true;
+        c.style = 'margin-left: 8px; margin-right: 8px;';
+        return false;
+      }
+
+      /* ShowAppsIcon - GNOME 50: has .icon (BaseIcon) directly and .child (toggleButton) */
+      /* ShowAppsIcon - GNOME 46: has .icon.icon (StIcon) */
+      if (c.icon /* BaseIcon or old IconGrid */) {
+        let stIcon = null;
+        // GNOME 50: icon is BaseIcon, icon.icon might be null initially
+        stIcon = this._getStIconFromAppwell(c);
+        if (!stIcon && c.icon.icon) {
+          stIcon = c.icon.icon;
+        }
+        if (stIcon) {
+          c._icon = stIcon;
+          // GNOME 50: child is toggleButton; GNOME 46: child is the button directly
+          c._button = c.child;
+          try {
+            c.icon.style = 'background-color: transparent !important;';
+          } catch (err) {
+            // ignore
+          }
+        }
+      }
+
+      /* DashItemContainer - GNOME 50: child (DashIcon/AppIcon) has .icon (BaseIcon) */
+      /* DashItemContainer - GNOME 46: child.icon.icon is StIcon */
+      if (c.child /* DashIcon/AppIcon */) {
+        let appwell = c.child;
+        let stIcon = null;
+        if (appwell.icon /* BaseIcon or old IconGrid */) {
+          stIcon = this._getStIconFromAppwell(appwell);
+          if (!stIcon && appwell.icon.icon) {
+            stIcon = appwell.icon.icon;
+          }
+        }
+        if (stIcon) {
+          c._grid = appwell.icon; // BaseIcon or old IconGrid
+          c._icon = stIcon;
+          c._appwell = appwell;
+          if (c._appwell) {
+            c._appwell.visible = true;
+            c._dot = c._appwell._dot;
+
+            let app = c._appwell.app;
+            let appId = app ? app.get_id() : '';
+
+            // peachOS UI surfaces that aren't apps and shouldn't take a dock slot:
+            // peachySearch (ulauncher) -- Spotlight overlay; KiwiMenu's "About This PC"
+            // window. Their Wayland windows can't set skip_taskbar, so the stock Dash
+            // counts them as running apps -- filter those icons out of the dock here.
+            const isNonAppSurface =
+              /^(io\.ulauncher\.Ulauncher|ulauncher|com\.github\.kemma\.KiwiMenu)\b/i.test(appId) ||
+              (app.get_windows &&
+                app.get_windows().some((w) => {
+                  const title = (w.get_title && w.get_title()) || '';
+                  if (title === 'peachySearch' || title === 'About This PC')
+                    return true;
+                  const cls = (
+                    (w.get_wm_class && w.get_wm_class()) ||
+                    ''
+                  ).toLowerCase();
+                  const inst = (
+                    (w.get_wm_class_instance && w.get_wm_class_instance()) ||
+                    ''
+                  ).toLowerCase();
+                  return cls.includes('kiwimenu') || inst.includes('kiwimenu');
+                }));
+            if (isNonAppSurface) {
+              c._appwell.visible = false;
+              c.width = -1;
+              c.height = -1;
+              return false;
+            }
+
+            // hide icons if favorites only
+            if (
+              !c.custom_icon &&
+              this._favorite_ids &&
+              !this._favorite_ids.includes(appId)
+            ) {
+              if (this.extension.favorites_only) {
+                c._appwell.visible = false;
+                c.width = -1;
+                c.height = -1;
+                return false;
+              } else if (!c._found) {
+                c._found = true;
+              }
+            }
+          }
+          if (c._dot) {
+            c._dot.opacity = 0;
+          }
+        }
+      }
+      
+      if (c._icon) {
+        // renderer takes care of displaying an icon
+        c._icon.opacity = 0;
+        c._label = c.label;
+
+        if (c._label && !c._destroyLabelConnectId) {
+          c._destroyLabelConnectId = c._label.connect('destroy', () => {
+            c._label = null;
+          });
+        }
+
+        // limitation: vertical layout cannot do apps_icon_front
+        if (
+          c == this.dash._showAppsIcon &&
+          this.extension.apps_icon_front &&
+          !this.isVertical()
+        ) {
+          this._icons.unshift(c);
+          this._dashItems.unshift(c);
+        } else {
+          this._icons.push(c);
+          this._dashItems.push(c);
+        }
+        return true;
+      }
+
+      return false;
+    }
+
+    _cleanupIcon(c) {
+      if (c._image && c._image.get_parent()) {
+        c._image.get_parent().remove_child(c._image);
+      }
+      if (c._menu && c._menu.actor) {
+        Main.uiGroup.remove_child(c._menu.actor);
+        c._menu = null;
+      }
+      if (c._label) {
+        let p = c._label.get_parent();
+        if (p) {
+          p.remove_child(c._label);
+        }
+      }
+    }
+
+    _findIcons() {
+      if (this._icons && !this._dragging) {
+        let _boxIconsLength = this.dash._box.get_children().length;
+        if (_boxIconsLength != this._boxIconsLength) {
+          this._icons = null;
+        }
+        this._boxIconsLength = _boxIconsLength;
+        if (this._extraIcons) {
+          let _extraIconsLength = this._extraIcons.get_children().length;
+          if (_extraIconsLength != this._extraIconsLength) {
+            this._icons = null;
+          }
+          this._extraIconsLength = _extraIconsLength;
+        }
+      }
+
+      if (this._icons) {
+        // use icons cache
+        return this._icons;
+      }
+
+      this._dashItems = [];
+      this._separators = [];
+      this._icons = [];
+
+      if (!this.dash) return [];
+
+      //--------------------
+      // find favorites and running apps icons
+      //--------------------
+      this.dash._box.get_children().forEach((icon) => {
+        this._inspectIcon(icon);
+      });
+
+      // dash._box has at most one favorites|running separator. extraIcons
+      // also has a dash-separator (trash/downloads). Those used to get lumped
+      // together and this loop then remove_child'd them all from _box -- the
+      // extraIcons one isn't a child of _box, and wiping the box separator
+      // left a hole after an icon-appearance swap with unpinned running apps.
+      const extraKids = new Set(
+        this._extraIcons ? this._extraIcons.get_children() : []
+      );
+      const boxSeps = this._separators.filter((s) => !extraKids.has(s));
+      while (boxSeps.length > 1) {
+        const extra = boxSeps.pop();
+        if (extra.get_parent() === this.dash._box) {
+          this.dash._box.remove_child(extra);
+        }
+        this._separators = this._separators.filter((s) => s !== extra);
+      }
+
+      // hide separator between running apps and favorites - if not needed
+      if (this.extension.favorites_only) {
+        if (this._separators.length) {
+          this._separators[0].visible = false;
+          this._separators = [];
+        }
+      } else {
+        if (this._separators.length) {
+          this._separators[0].visible = true;
+        }
+      }
+
+      //--------------------
+      // find custom icons (trash, mounts, downloads, etc...)
+      //--------------------
+      if (this._extraIcons) {
+        this._extraIcons.get_children().forEach((icon) => {
+          this._inspectIcon(icon);
+        });
+        this._extraIcons.visible = extraIconsVisible(
+          this._extraIcons.get_children().length,
+          this.extension.separator_thickness
+        );
+      }
+
+      //--------------------
+      // find the showAppsIcon
+      //--------------------
+      if (this.dash._showAppsIcon) {
+        this.dash._showAppsIcon.visible = this.extension.apps_icon;
+        if (this._inspectIcon(this.dash._showAppsIcon)) {
+          let icon = this.dash._showAppsIcon._icon;
+          if (!icon._connected) {
+            icon._connected = true;
+            icon.connectObject(
+              'button-press-event',
+              () => {
+                let overview = Main.uiGroup
+                  .get_children()
+                  .find((c) => c.name == 'overviewGroup')
+                  .get_children()
+                  .find((c) => c.name == 'overview');
+                if (overview._delegate.visible) {
+                  overview._delegate.toggle();
+                } else {
+                  overview._delegate.showApps();
+                }
+                return Clutter.EVENT_PROPAGATE;
+              },
+              'enter-event',
+              () => {
+                this.dash._showAppsIcon.showLabel();
+              },
+              'leave-event',
+              () => {
+                this.dash._showAppsIcon.hideLabel();
+              },
+              this
+            );
+          }
+        }
+      }
+
+      let noAnimation = !this.extension.animate_icons_unmute;
+
+      let pv = new Point();
+      pv.x = 0.5;
+      pv.y = 0.5;
+      this._icons.forEach((c) => {
+        if (!c._showLabel && c.showLabel) {
+          c._showLabel = c.showLabel;
+          c.showLabel = () => {
+            if (this.extension.hide_labels) {
+              return;
+            }
+            if (c._label) {
+              c._showLabel();
+              this._positionLabelTail(c);
+            }
+          };
+        }
+        // Plain method-wrapping, same as showLabel above -- deliberately NOT
+        // label.connect('destroy'/'notify::...', ...): a persistent GObject signal
+        // closure held on the dash-label was the actual cause of a real crash (GNOME
+        // Shell aborting with SIGABRT, journalctl showing "Attempting to call back into
+        // JSAPI during the sweeping phase of GC ... not destroying a Clutter actor ...
+        // with ::destroy signals connected" right before it). This wrapper approach holds
+        // no reference into the label's own signal system at all.
+        if (!c._hideLabel && c.hideLabel) {
+          c._hideLabel = c.hideLabel;
+          c.hideLabel = () => {
+            c._hideLabel();
+            this._destroyLabelTail(c);
+          };
+        }
+        c._icon.track_hover = true;
+        c._icon.reactive = true;
+        c._icon.pivot_point = pv;
+        if (c._button) {
+          c._button.reactive = noAnimation;
+          c._button.track_hover = noAnimation;
+          c.toggle_mode = false;
+        }
+        if (c._grid) {
+          // c._grid.style = noAnimation ? '' : 'background: none !important;';
+          c._grid.style = 'background: none !important;';
+        }
+        if (c._appwell && !c._appwell._activate) {
+          c._appwell._activate = c._appwell.activate;
+          c._appwell.activate = () => {
+            try {
+              if (!c._menu) {
+                this._maybeBounce(c);
+              }
+              this._maybeMinimizeOrMaximize(c._appwell.app);
+              c._appwell._activate();
+            } catch (err) {
+              // happens with dummy DashIcons
+            }
+          };
+        }
+        let icon = c._icon;
+        if (icon && !icon._destroyConnectId) {
+          icon._destroyConnectId = icon.connect('destroy', () => {
+            this._cleanupIcon(c);
+          });
+        }
+        let { _draggable } = c.child;
+        if (_draggable && !_draggable._dragBeginId) {
+          _draggable._dragBeginId = _draggable.connect('drag-begin', () => {
+            this._dragging = true;
+            this._dragged = icon;
+          });
+          _draggable._dragEndId = _draggable.connect('drag-end', () => {
+            this._dragging = false;
+            this._icons = null;
+          });
+        }
+
+        // "Add separator here" on every app icon's context menu -- the always-
+        // available entry point. App icons use the stock AppIconMenu; wrap
+        // popupMenu once so the item is appended after the menu is (re)built.
+        let appwell = c.child;
+        if (appwell && appwell.popupMenu && !appwell._peachSepMenuWrapped) {
+          appwell._peachSepMenuWrapped = true;
+          let origPopupMenu = appwell.popupMenu.bind(appwell);
+          appwell.popupMenu = (...args) => {
+            let ret = origPopupMenu(...args);
+            try {
+              let menu = appwell._menu;
+              // stock AppIconMenu may rebuild its items -- re-add if absent
+              let has = menu
+                ?._getMenuItems?.()
+                .some((it) => it.label?.text === 'Add separator here');
+              if (menu && menu.addAction && !has) {
+                menu.addAction('Add separator here', () =>
+                  this.addSeparatorNear(this._iconIdentity(c), false)
+                );
+              }
+            } catch (err) {
+              console.log(err);
+            }
+            return ret;
+          };
+        }
+      });
+
+      // splice user-created separator markers into _dashItems so the link-list
+      // below hands each one its _prev / _next for free
+      this._buildUserSeparators();
+
+      // link list the dash items
+      //! optimize this. there has to be a better way to get the separators _prev and _next
+      let prev = null;
+      this._dashItems.forEach((c) => {
+        if (prev) {
+          prev._next = c;
+        }
+        c._prev = prev;
+        prev = c;
+      });
+
+      // per-icon cumulative gap opened up by every user separator to its left,
+      // then recentered so the extra width grows evenly instead of shoving
+      // trash off the right edge of the glass.
+      let shift = 0;
+      this._dashItems.forEach((it) => {
+        if (it._userSeparator) {
+          shift += SEP_GAP;
+          it._sepShift = shift;
+        } else if (it._icon) {
+          it._sepShift = shift;
+        }
+      });
+      if (shift) {
+        this._dashItems.forEach((it) => {
+          if (it._sepShift != null) it._sepShift -= shift / 2;
+        });
+      }
+
+      return this._icons;
+    }
+
+    // A stable identity string for a dock item -- an app's .desktop id for app
+    // icons, a ":name" token for the peachOS special icons. Used as the anchor
+    // (`after`) for user separators.
+    _iconIdentity(c) {
+      if (!c) return '';
+      if (c === this.dash?._showAppsIcon) return ':showapps';
+      if (c === this._trashIcon) return ':trash';
+      if (c === this._downloadsIcon) return ':downloads';
+      if (c === this._recentFilesIcon) return ':recent';
+      if (c === this._documentsIcon) return ':documents';
+      let app = c._appwell?.app;
+      if (app && app.get_id) return app.get_id();
+      return '';
+    }
+
+    _buildUserSeparators() {
+      this._userSeparators = [];
+      let stored = this.extension.customSeparators || [];
+      if (!stored.length) return;
+
+      stored.forEach((entry) => {
+        if (!entry || typeof entry.id !== 'string') return;
+        let after = entry.after || '';
+        let marker = { _userSeparator: true, id: entry.id, after };
+
+        // find where in _dashItems this separator sits
+        let insertAt = 0; // front ("" anchor)
+        if (after) {
+          let anchorIdx = this._dashItems.findIndex(
+            (it) => !it._userSeparator && this._iconIdentity(it) === after
+          );
+          if (anchorIdx < 0) {
+            // anchor icon isn't present right now -- drop the marker for this
+            // pass, but keep it in the setting so it comes back if the app does
+            return;
+          }
+          insertAt = anchorIdx + 1;
+        }
+        this._dashItems.splice(insertAt, 0, marker);
+        this._userSeparators.push(marker);
+      });
+    }
+
+    // Add a separator near a given app icon. Tries the gap to its right first
+    // (or to its left when preferLeft -- e.g. right-clicking a built-in
+    // separator, or the right-most pinned app), then searches outward for the
+    // first gap that _gapIsValid accepts. No-op if there's nowhere legal.
+    addSeparatorNear(afterIdentity, preferLeft = false) {
+      let ids = this._orderedIconIds();
+      let anchorIdx = afterIdentity ? ids.indexOf(afterIdentity) : ids.length;
+
+      // candidate "after" anchors, closest-first
+      let cands = [];
+      let right = afterIdentity || (ids.length ? ids[ids.length - 1] : '');
+      let left = anchorIdx > 0 ? ids[anchorIdx - 1] : '';
+      cands.push(preferLeft ? left : right);
+      cands.push(preferLeft ? right : left);
+      for (let d = 2; d < ids.length + 2; d++) {
+        let li = anchorIdx - d;
+        let ri = anchorIdx + d - 1;
+        if (li >= 0) cands.push(ids[li]);
+        else if (li === -1) cands.push('');
+        if (ri >= 0 && ri < ids.length) cands.push(ids[ri]);
+      }
+
+      let seen = new Set();
+      let chosen;
+      for (let c of cands) {
+        if (c === undefined || seen.has(c)) continue;
+        seen.add(c);
+        if (this._gapIsValid(c, null)) {
+          chosen = c;
+          break;
+        }
+      }
+      if (chosen === undefined) return;
+
+      let list = this.extension.customSeparators;
+      list.push({
+        id: 'sep-' + Math.random().toString(36).slice(2, 10),
+        after: chosen,
+      });
+      this.extension.setCustomSeparators(list);
+    }
+
+    removeSeparator(id) {
+      let list = this.extension.customSeparators.filter((s) => s.id !== id);
+      this.extension.setCustomSeparators(list);
+    }
+
+    /**
+     * macOS Tahoe dock tooltip has a small triangular tail pointing down at the icon --
+     * GNOME's own dash-label has no such thing, and St can't draw an arbitrary rotated-
+     * square speech-bubble tail purely in CSS, so this positions a small pre-rendered
+     * triangle asset (icons/dock-label-tail.png) as a sibling of the real label instead.
+     *
+     * Deliberately holds NO GObject signal connection on the label (no .connect() at all
+     * here) -- an earlier version connected 'notify::allocation' / 'notify::opacity' /
+     * 'destroy' closures directly on the dash-label to keep the tail in sync, and that was
+     * a real, reproducible crash: GNOME Shell aborting with SIGABRT, journalctl showing
+     * "Attempting to call back into JSAPI during the sweeping phase of GC ... not
+     * destroying a Clutter actor ... with ::destroy signals connected" right before each
+     * one. A persistent closure held on a dash-label -- an actor whose own lifecycle isn't
+     * fully under this code's control -- is exactly the pattern that warning describes.
+     * hideLabel is wrapped (below) to destroy the tail directly instead, the same
+     * plain-method-wrapping approach showLabel already uses safely.
+     */
+    _positionLabelTail(c) {
+      let label = c._label;
+      if (!label) return;
+      let parent = label.get_parent();
+      if (!parent) return;
+
+      if (!c._labelTail) {
+        c._labelTailLight = Gio.icon_new_for_string(
+          `${this.extension.path}/icons/dock-label-tail.png`
+        );
+        c._labelTailDark = Gio.icon_new_for_string(
+          `${this.extension.path}/icons/dock-label-tail-dark.png`
+        );
+        c._labelTail = new St.Icon({
+          gicon: c._labelTailLight,
+          style_class: 'macos-dock-label-tail',
+        });
+        parent.add_child(c._labelTail);
+        parent.set_child_below_sibling(c._labelTail, label);
+      }
+
+      this._syncLabelTail(c);
+
+      // A label's position/size aren't necessarily settled the instant _showLabel()
+      // returns, so this re-syncs once more on the next main-loop iteration to catch that
+      // -- a one-shot, self-removing GLib timeout, not a persistent signal connection like
+      // the crash above. Guarded against overlapping hover-in/out by clearing any pending
+      // one first, and the callback itself re-checks c._label/_labelTail still exist
+      // before touching them, in case the icon was un-hovered in the meantime.
+      if (c._labelTailSyncId) {
+        GLib.source_remove(c._labelTailSyncId);
+      }
+      c._labelTailSyncId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 0, () => {
+        c._labelTailSyncId = 0;
+        this._syncLabelTail(c);
+        return GLib.SOURCE_REMOVE;
+      });
+    }
+
+    _syncLabelTail(c) {
+      let label = c._label;
+      if (!label || !c._labelTail) return;
+
+      const TAIL_SIZE = 8;
+      const OVERLAP = 4; // how far the tail tucks up behind the bubble's bottom edge
+      let [lx, ly] = label.get_position();
+      c._labelTail.set_size(TAIL_SIZE, TAIL_SIZE);
+      c._labelTail.set_position(
+        Math.round(lx + label.width / 2 - TAIL_SIZE / 2),
+        Math.round(ly + label.height - OVERLAP)
+      );
+      c._labelTail.opacity = label.opacity;
+
+      // Own, self-contained settings read (matches AppearanceController's own pattern in
+      // macOS-TopBar-Gnome) rather than reaching into this.extension's internals, whose
+      // exact shape from here isn't guaranteed -- wrapped defensively either way so a
+      // failure here can only ever affect which color is picked, never the position set
+      // above.
+      try {
+        if (!this._interfaceSettingsForLabels) {
+          this._interfaceSettingsForLabels = new Gio.Settings({
+            schema_id: 'org.gnome.desktop.interface',
+          });
+        }
+        let isDark =
+          this._interfaceSettingsForLabels.get_string('color-scheme') === 'prefer-dark';
+        if (isDark) {
+          label.add_style_class_name('macos-dock-label-dark');
+          c._labelTail.gicon = c._labelTailDark;
+        } else {
+          label.remove_style_class_name('macos-dock-label-dark');
+          c._labelTail.gicon = c._labelTailLight;
+        }
+      } catch (e) {
+        logError(e, '[macos-dock] label dark-mode check failed');
+      }
+    }
+
+    _destroyLabelTail(c) {
+      if (c._labelTailSyncId) {
+        GLib.source_remove(c._labelTailSyncId);
+        c._labelTailSyncId = 0;
+      }
+      if (c._labelTail) {
+        c._labelTail.destroy();
+        c._labelTail = null;
+      }
+    }
+
+    _updateExtraIcons() {
+      if (!this._extraIcons) {
+        return;
+      }
+
+      // check these intermittently!
+      //---------------
+      // the mount icons
+      //---------------
+      {
+        //! avoid creating app_info & /tmp/*.desktop files
+        let extras = [...this._extraIcons.get_children()];
+        let extraMountPaths = extras.map((e) => e._mountPath);
+        let mounted = Object.keys(this.extension.services._mounts);
+
+        extras.forEach((extra) => {
+          if (!extra._mountType) {
+            return;
+          }
+          if (!mounted.includes(extra._mountPath)) {
+            this._extraIcons.remove_child(extra);
+            this._icons = null;
+          }
+        });
+
+        mounted.forEach((mount) => {
+          if (!extraMountPaths.includes(mount)) {
+            let mountedIcon = this.createItem(mount);
+            mountedIcon._mountType = true;
+            mountedIcon._mountPath = mount;
+            this._icons = null;
+          }
+        });
+      }
+
+      //---------------
+      // the folder icons
+      //---------------
+      //! add explanations
+      let folders = [
+        {
+          icon: '_recentFilesIcon',
+          folder: 'recent:///',
+          //! find a way to avoid this
+          path: `${this.extension.path}/apps/recents-dash2dock-lite.desktop`,
+          // not ready for prime time
+          // does not work on gnome 43 (debian)
+          show: false, // this.extension.documents_icon,
+          prepare: this.extension.services.checkRecents.bind(
+            this.extension.services
+          ),
+          items: '_recentFiles',
+          itemsLength: '_recentFilesLength',
+          cleanup: (() => {
+            // this.extension.services._recentFiles = null;
+          }).bind(this),
+        },
+        {
+          icon: '_downloadsIcon',
+          folder: Gio.File.new_for_path('Downloads').get_path(),
+          //! find a way to avoid this
+          path: tempPath('downloads-dash2dock-lite.desktop'),
+          show: this.extension.downloads_icon,
+          items: '_downloadFiles',
+          itemsLength: '_downloadFilesLength',
+          prepare: (() => {
+            this.extension.services._debounceCheckDownloads();
+          }).bind(this),
+          cleanup: () => {},
+        },
+      ];
+
+      folders.forEach((f) => {
+        if (!this[f.icon] && f.show) {
+          this[f.icon] = DockItemList.createItem(this, f);
+          this._icons = null;
+        } else if (this[f.icon] && !f.show) {
+          // unpin downloads icon
+          this._extraIcons.remove_child(this[f.icon]);
+          this[f.icon] = null;
+          this._icons = null;
+        }
+        f.cleanup();
+      });
+
+      //---------------
+      // the trash icon
+      //---------------
+      if (!this._trashIcon && this.extension.trash_icon) {
+        // pin trash icon
+        //! avoid creating app_info & /tmp/*.desktop files
+        this._trashIcon = this.createItem(
+          tempPath('trash-dash2dock-lite.desktop')
+        );
+        this._icons = null;
+      } else if (this._trashIcon && !this.extension.trash_icon) {
+        // unpin trash icon
+        this._extraIcons.remove_child(this._trashIcon);
+        this._trashIcon = null;
+        this._icons = null;
+      } else if (this._trashIcon && this.extension.trash_icon) {
+        // move trash icon to the end
+        if (this._extraIcons.last_child != this._trashIcon) {
+          this._extraIcons.remove_child(this._trashIcon);
+          this._extraIcons.add_child(this._trashIcon);
+        }
+      }
+    }
+
+    _snapToContainerEdge(container, child, edge = true) {
+      child.x = container.width / 2 - child.width / 2;
+      child.y = container.height / 2 - child.height / 2;
+      if (edge) {
+        if (this.isVertical()) {
+          if (this._position == DockPosition.LEFT) {
+            child.x = 0;
+          } else {
+            child.x = container.width - child.width;
+          }
+        } else {
+          if (this._position == DockPosition.TOP) {
+            child.y = 0;
+          } else {
+            child.y = container.height - child.height;
+          }
+        }
+      }
+    }
+
+    layout() {
+      if (!this.dash || !this.dash.last_child) return;
+      if (this.extension.apps_icon_front) {
+        this.dash.last_child.text_direction = 2; // RTL
+        this.dash._box.text_direction = 1; // LTR
+      } else {
+        this.dash.last_child.text_direction = 1; // LTR
+        this.dash._box.text_direction = 1; // LTR
+      }
+
+      const locations = [
+        DockPosition.BOTTOM,
+        DockPosition.LEFT,
+        DockPosition.RIGHT,
+        DockPosition.TOP,
+      ];
+      this._position =
+        locations[this.extension.dock_location] || DockPosition.BOTTOM;
+
+      if (this._config) {
+        if (this._config['position']) {
+          this._position = this._config['position'];
+        }
+      }
+
+      this._updateExtraIcons();
+
+      let m = this.getMonitor();
+      if (!m) {
+        return false;
+      }
+
+      let scaleFactor = m.geometry_scale;
+      let vertical = this.isVertical();
+      this._scaleFactor = scaleFactor;
+
+      this._icons = this._findIcons();
+
+      //! add explanation
+      let flags = {
+        top: {
+          edgeX: 0,
+          edgeY: 0,
+          offsetX: 0,
+          offsetY: 0,
+        },
+        bottom: {
+          edgeX: 0,
+          edgeY: 1,
+          offsetX: 0,
+          offsetY: -1,
+        },
+        left: {
+          edgeX: 0,
+          edgeY: 0,
+          offsetX: 0,
+          offsetY: 0,
+        },
+        right: {
+          edgeX: 1,
+          edgeY: 0,
+          offsetX: -1,
+          offsetY: 0,
+        },
+      };
+      let f = flags[this._position];
+
+      let width = 1200;
+      let height = 140;
+      //! use dock size limit - add preferences
+      let dock_size_limit = 1;
+      let animation_spread = this.extension.animation_spread;
+      // let animation_magnify = this.extension.animation_magnify;
+
+      let iconMargins = 0;
+      let iconStyle = '';
+      let iconSize = this._preferredIconSize();
+      let iconSizeSpaced = iconSpacedSize(
+        iconSize,
+        this.extension.icon_spacing,
+        animation_spread
+      );
+
+      let projectedWidth =
+        iconSize +
+        // (this.animated ? iconSizeSpaced : 0) +
+        iconSizeSpaced * (this._icons.length > 3 ? this._icons.length : 3);
+      projectedWidth += iconMargins;
+      // room for the gap each user separator opens up
+      projectedWidth += (this._userSeparators?.length || 0) * SEP_GAP;
+
+      let scaleDown = 1.0;
+      let limit = vertical ? 0.96 : 0.98; // use dock_size_limit
+      let maxWidth = (vertical ? m.height : m.width) * limit;
+      if (projectedWidth * scaleFactor > maxWidth * 0.98) {
+        scaleDown = (maxWidth - iconSize / 2) / (projectedWidth * scaleFactor);
+      }
+
+      iconSize *= scaleDown;
+      iconSizeSpaced *= scaleDown;
+      projectedWidth *= scaleDown;
+
+      // make multiple of 2
+      iconSize = Math.floor(iconSize / 2) * 2;
+      iconSizeSpaced = Math.floor(iconSizeSpaced / 2) * 2;
+      projectedWidth = Math.floor(projectedWidth / 2) * 2;
+
+      this._projectedWidth = projectedWidth;
+      this._margin = iconMargins;
+
+      this._edge_distance =
+        (this.extension.edge_distance || 0) * 20 * scaleFactor;
+
+      if (this.extension.panel_mode) {
+        this._edge_distance = 0;
+      }
+
+      this._icons.forEach((icon) => {
+        icon.width = Math.floor(iconSizeSpaced * scaleFactor);
+        icon.height = Math.floor(iconSizeSpaced * scaleFactor);
+        if (icon.style != iconStyle) {
+          icon.style = iconStyle;
+        }
+      });
+
+      //! check with multi-monitor and scaled displays
+      this.x = m.x;
+      this.y = m.y;
+      this.width = m.width;
+      this.height = m.height;
+
+      // reorient and reposition the dash
+      this.dash.last_child.layout_manager.orientation = vertical;
+      this.dash._box.layout_manager.orientation = vertical;
+      if (this._extraIcons) {
+        this._extraIcons.layout_manager.orientation = vertical;
+      }
+
+      // hug the edge
+      // if (vertical) {
+      //   this.dash.x = this.width * f.edgeX + this.dash.width * f.offsetX;
+      //   this.dash.y = this.height / 2 - this.dash.height / 2;
+      // } else {
+      //   this.dash.x = this.width / 2 - this.dash.width / 2;
+      //   this.dash.y = this.height * f.edgeY + this.dash.height * f.offsetY;
+      // }
+
+      // computation derived from animation scale
+      let magnify = this.extension.animation_magnify * 1.8;
+      let fp = iconSize * 2 + iconSize * (0.6 * (1 + magnify));
+      if (vertical) {
+        this.width = fp * scaleFactor;
+      } else {
+        this.height = fp * scaleFactor;
+      }
+      this._snapToContainerEdge(m, this, true);
+      this.x += m.x;
+      this.y += m.y;
+      this._snapToContainerEdge(this, this.dash, true);
+
+      this._iconSizeScaledDown = iconSize;
+      this._scaledDown = scaleDown;
+
+      // dwell
+      //! add scaleFactor?
+      let dwellHeight = 2;
+      if (vertical) {
+        this.dwell.width = dwellHeight;
+        this.dwell.height = this.height;
+        this.dwell.x = m.x;
+        this.dwell.y = this.y;
+        if (this._position == DockPosition.RIGHT) {
+          this.dwell.x = m.x + m.width - dwellHeight;
+        }
+      } else {
+        this.dwell.width = this.width;
+        this.dwell.height = dwellHeight;
+        this.dwell.x = this.x;
+        this.dwell.y = this.y + this.height - this.dwell.height;
+        if (this._position == DockPosition.TOP) {
+          this.dwell.y = this.y;
+        }
+      }
+
+      this.extension.integrations?.updateWindowsIconGeometry();
+
+      return true;
+    }
+
+    _updateTransparenies() {
+      let transparent =
+        (Main.overview.visible || this.extension._inOverview) &&
+        this.extension.overview_transparent_background;
+
+      this._background.opacity = transparent ? 0 : 255;
+
+      if (this.animator._bms && this.animator._bms.first_child) {
+        this.animator._bms.first_child.visible =
+          !transparent && (this.extension.liquid_glass || this.extension.blur_background);
+      }
+
+      if (this.extension.customize_topbar) {
+        let transparent_topbar =
+          (Main.overview.visible || this.extension._inOverview) &&
+          this.extension.overview_transparent_topbar_background;
+
+        // Only ever touch Main.panel.style if WE own it right now. peachOS runs
+        // macos-top-panel@local.dev, which manages Main.panel.style itself -- the old
+        // `else { Main.panel.style = '' }` here blew that away on every dock tick, and
+        // when the shell theme wasn't masking it that left the bar stock-opaque-black.
+        const OURS = 'border: 0px; background: transparent;';
+        if (transparent_topbar && (Main.panel.style == '' || Main.panel.style == null)) {
+          Main.panel.style = OURS;
+        } else if (!transparent_topbar && Main.panel.style == OURS) {
+          Main.panel.style = '';
+        }
+      }
+    }
+
+    preview() {
+      this._preview = PREVIEW_FRAMES;
+      this.animator._computed = null;
+    }
+
+    animate(dt = 15) {
+      if (this._preview) {
+        let p = null;
+
+        if (this._icons && this._icons.length) {
+          let icon = this._icons[this._icons.length >> 1];
+          p = icon._icon.get_transformed_position();
+          let s = icon._icon.get_transformed_size();
+          p[0] += s[0] / 2;
+          p[1] += s[1] / 2;
+        }
+
+        if (!p) {
+          p = this.dash.get_transformed_position();
+          p[0] += this.dash.width / 2;
+          p[1] += this.dash.height / 2;
+        }
+
+        this.simulated_pointer = p;
+        this._preview--;
+      }
+
+      //! add layout here instead of at the
+      this.animator.animate(dt);
+      this.extension.integrations?.updateWindowsIconGeometry();
+
+      // hack to mitigate jerkiness when a new icon is inserted
+      if (!this._pauseBounce || this._pauseBounce <= 0) {
+        while (this._fast_forward && this._fast_forward-- > 0) {
+          this.animate(dt);
+          this.dash.opacity = 0;
+        }
+      }
+      this.simulated_pointer = null;
+
+      if (this._pauseBounce && this._pauseBounce > 0) {
+        this._pauseBounce -= dt;
+      }
+    }
+
+    //! move these generic functions outside of this class
+    _isWithinDash(p) {
+      if (this._hidden) {
+        return false;
+      }
+      let xy = this.struts.get_transformed_position();
+      let wh = [this.struts.width, this.struts.height];
+      if (isInRect([xy[0], xy[1], wh[0], wh[1]], p, 20)) {
+        return true;
+      }
+      return false;
+    }
+
+    _beginAnimation(caller) {
+      if (this.extension.debug_visual) {
+        this.add_style_class_name('hi');
+        this.struts.add_style_class_name('hi');
+        this.dwell.add_style_class_name('hi');
+      }
+
+      this._favorite_ids = Fav.getAppFavorites()._getIds();
+
+      // if (caller) {
+      //   console.log(`animation triggered by ${caller}`);
+      // }
+      if (this.extension._hiTimer && this.debounceEndSeq) {
+        this.extension._loTimer.runDebounced(this.debounceEndSeq);
+        // this.extension._loTimer.cancel(this.debounceEndSeq);
+      }
+
+      this.animationInterval = this.extension.animationInterval;
+      if (this.extension._hiTimer) {
+        if (!this._animationSeq) {
+          this._animationSeq = this.extension._hiTimer.runLoop(
+            (s) => {
+              this.animate(s._delay);
+            },
+            this.animationInterval,
+            'animationTimer'
+          );
+        } else {
+          this.extension._hiTimer.runLoop(this._animationSeq);
+        }
+      }
+    }
+
+    _endAnimation() {
+      if (this.extension.debug_visual) {
+        this.remove_style_class_name('hi');
+        this.struts.remove_style_class_name('hi');
+        this.dwell.remove_style_class_name('hi');
+      }
+
+      this._updateFocusedIcon();
+
+      if (this.extension._hiTimer) {
+        this.extension._hiTimer.cancel(this._animationSeq);
+        this.extension._loTimer.cancel(this.debounceEndSeq);
+      }
+      this.autohider._debounceCheckHide();
+      this._icons = null;
+      this._dragged = null;
+      this._lastHoveredIcon = null;
+    }
+
+    _destroyList() {
+      if (this._list) {
+        Main.uiGroup.remove_child(this._list);
+        this._list = null;
+      }
+    }
+
+    _debounceEndAnimation() {
+      if (this.extension._loTimer) {
+        if (!this.debounceEndSeq) {
+          this.debounceEndSeq = this.extension._loTimer.runDebounced(
+            () => {
+              this._endAnimation();
+            },
+            ANIM_DEBOUNCE_END_DELAY + this.animationInterval,
+            'debounceEndAnimation'
+          );
+        } else {
+          this.extension._loTimer.runDebounced(this.debounceEndSeq);
+        }
+      }
+    }
+
+    cancelAnimations() {
+      this.extension._hiTimer.cancel(this._animationSeq);
+      this._animationSeq = null;
+      this.extension._hiTimer.cancel(this.autohider._animationSeq);
+      this.autohider._animationSeq = null;
+    }
+
+    _updateFocusedIcon() {
+      // apply focus
+      this._icons?.forEach((icon) => {
+        if (!icon._renderer) return;
+        if (icon._appwell?.app) {
+          let app = icon._appwell?.app;
+          if (!app.get_windows) return;
+          let windows = this.getAppWindowsFiltered(app);
+          windows.forEach((w) => {
+            if (w.has_focus()) {
+              icon._renderer.set_style_class_name('icon-focused');
+              // icon._renderer.style = 'background-color: rgba(255,0,0,0.2); border-radius: 8px;'
+            }
+          });
+        }
+      });
+    }
+
+    _maybeMinimizeOrMaximize(app) {
+      if (!app.get_windows) {
+        return;
+      }
+
+      // let windows = app.get_windows();
+      let windows = this.getAppWindowsFiltered(app);
+      if (!windows.length) {
+        return;
+      }
+
+      let event = Clutter.get_current_event();
+      let modifiers = event ? event.get_state() : 0;
+      let pressed = event.type() == Clutter.EventType.BUTTON_PRESS;
+      let button1 = (modifiers & Clutter.ModifierType.BUTTON1_MASK) != 0;
+      let button2 = (modifiers & Clutter.ModifierType.BUTTON2_MASK) != 0;
+      let button3 = (modifiers & Clutter.ModifierType.BUTTON3_MASK) != 0;
+      let shift = (modifiers & Clutter.ModifierType.SHIFT_MASK) != 0;
+      let isMiddleButton = button3; // middle?
+      let isCtrlPressed = (modifiers & Clutter.ModifierType.CONTROL_MASK) != 0;
+      let openNewWindow =
+        app.can_open_new_window() &&
+        app.state == Shell.AppState.RUNNING &&
+        (isCtrlPressed || isMiddleButton);
+      if (openNewWindow) return;
+
+      let workspaceManager = global.workspace_manager;
+      let activeWs = workspaceManager.get_active_workspace();
+      let focusedWindow = null;
+
+      windows.forEach((w) => {
+        if (w.has_focus()) {
+          focusedWindow = w;
+        }
+      });
+
+      // delay - allow dash to actually call 'activate' first
+      if (focusedWindow) {
+        this.extension._hiTimer.runOnce(() => {
+          if (shift) {
+            if (
+              (focusedWindow.is_maximized && focusedWindow.is_maximized()) ||
+              (focusedWindow.get_maximized &&
+                focusedWindow.get_maximized() == 3)
+            ) {
+              focusedWindow.unmaximize(3);
+            } else {
+              focusedWindow.maximize(3);
+            }
+          } else {
+            windows.forEach((w) => {
+              w.minimize();
+            });
+          }
+        }, 50);
+      } else {
+        const hidden = windows.filter((w) => {
+          return w.is_hidden();
+        });
+
+        // multi-monitors fix -- where focus can seem to get lost
+        if (!hidden.length) {
+          let windows = app.get_windows().filter((w) => {
+            return w.get_monitor() == this._monitor.index;
+          });
+          if (windows.length > 0) {
+            this.extension._hiTimer.runOnce(() => {
+              this._raiseAndFocus(windows[0]);
+            }, 50);
+          }
+          return;
+        }
+
+        this.extension._hiTimer.runOnce(() => {
+          windows.forEach((w) => {
+            if (w.is_hidden()) {
+              w.unminimize();
+              if (w.has_focus()) {
+                w.raise();
+              }
+            }
+          });
+        }, 50);
+      }
+    }
+
+    _pauseAllBounce(t = 250) {
+      this._pauseBounce = t;
+    }
+
+    _maybeBounce(container, just_do_it) {
+      if (this._pauseBounce && this._pauseBounce > 0) {
+        return;
+      }
+      if (!this.extension.open_app_animation) {
+        return;
+      }
+      if (
+        !container.child.app ||
+        (container.child.app &&
+          container.child.app.get_n_windows &&
+          !container.child.app.get_n_windows())
+      ) {
+        if (container.child) {
+          this.animator.bounceIcon(container.child);
+          return;
+        }
+      }
+      // bounce the custom icons
+      if (container.custom_icon || just_do_it) {
+        this.animator.bounceIcon(container.child);
+      }
+    }
+
+    getAppWindowsFiltered(app) {
+      var apply_filtering = this.extension.multi_monitor_filter != 0;
+
+      // no filtering needed for a single dock
+      if (apply_filtering && this.extension.multi_monitor_preference == 0) {
+        apply_filtering = false;
+      }
+
+      // no filtering needed on single monitor desktop
+      if (apply_filtering && Main.layoutManager.monitors.length == 1) {
+        apply_filtering = false;
+      }
+
+      // apply filtering only if app appears on multiple monitors
+      // 2 - whenever applicable
+      if (apply_filtering && this.extension.multi_monitor_filter == 2) {
+        var on_current_monitor = false;
+        var on_other_monitor = false;
+
+        app.get_windows().forEach((w) => {
+          on_current_monitor =
+            on_current_monitor || w.get_monitor() == this._monitor.index;
+          on_other_monitor =
+            on_other_monitor || w.get_monitor() != this._monitor.index;
+        });
+
+        if (!(on_current_monitor && on_other_monitor)) {
+          apply_filtering = false;
+        }
+      }
+
+      if (apply_filtering) {
+        return app.get_windows().filter((w) => {
+          return w.get_monitor() == this._monitor.index;
+        });
+      }
+      return app.get_windows();
+    }
+
+    _onScrollEvent(obj, evt) {
+      this._lastScrollEvent = evt;
+      let pointer = global.get_pointer();
+      let target = this._nearestIcon; // this._hoveredIcon;
+      // console.log(`${target == this._hoveredIcon}`);
+      if (target) {
+        if (this._scrollCounter < -2 || this._scrollCounter > 2)
+          this._scrollCounter = 0;
+
+        let icon = target;
+
+        // adjustment for touch scroll (much more sensitive) and mouse scrollwheel
+        let multiplier = 1;
+        if (
+          evt.get_source_device().get_device_type() == 5 ||
+          evt.get_source_device().get_device_name().includes('Touch')
+        ) {
+          multiplier = 1;
+        } else {
+          multiplier = 5;
+        }
+
+        let SCROLL_RESOLUTION =
+          MIN_SCROLL_RESOLUTION +
+          MAX_SCROLL_RESOLUTION -
+          (MAX_SCROLL_RESOLUTION * this.extension.scroll_sensitivity || 0);
+
+        if (icon._appwell && icon._appwell.app) {
+          this._lastScrollObject = icon;
+          let direction = evt.get_scroll_direction();
+          switch (direction) {
+            case Clutter.ScrollDirection.UP:
+            case Clutter.ScrollDirection.LEFT:
+              this._scrollCounter += (1 / SCROLL_RESOLUTION) * multiplier;
+              break;
+            case Clutter.ScrollDirection.DOWN:
+            case Clutter.ScrollDirection.RIGHT:
+              this._scrollCounter -= (1 / SCROLL_RESOLUTION) * multiplier;
+              break;
+          }
+          this._cycleWindows(icon._appwell.app, evt);
+        }
+      }
+    }
+
+    // an overly sensitive setting will make window cycle too fast. allow a half second pause after each cycle
+    _lockCycle() {
+      if (this._lockedCycle) return;
+      this._lockedCycle = true;
+      this.extension._hiTimer.runOnce(() => {
+        this._lockedCycle = false;
+      }, 150);
+    }
+
+    _raiseAndFocus(w) {
+      let workspaceManager = global.workspace_manager;
+      let activeWs = workspaceManager.get_active_workspace();
+      if (activeWs == w.get_workspace()) {
+        w.raise();
+        w.focus(0);
+      } else {
+        activeWs.activate_with_focus(w, global.get_current_time());
+      }
+    }
+
+    _cycleWindows(app, evt) {
+      if (this._lockedCycle) {
+        this._scrollCounter = 0;
+        return false;
+      }
+
+      let focusId = 0;
+      let workspaceManager = global.workspace_manager;
+      let activeWs = workspaceManager.get_active_workspace();
+
+      // let windows = app.get_windows();
+      let windows = this.getAppWindowsFiltered(app);
+
+      if (evt.modifier_state & Clutter.ModifierType.CONTROL_MASK) {
+        windows = windows.filter((w) => {
+          return activeWs == w.get_workspace();
+        });
+      }
+
+      let nw = windows.length;
+      windows.sort((w1, w2) => {
+        return w1.get_id() > w2.get_id() ? -1 : 1;
+      });
+
+      //! add explanations
+      if (nw > 1) {
+        for (let i = 0; i < nw; i++) {
+          if (windows[i].has_focus()) {
+            focusId = i;
+          }
+          if (windows[i].is_hidden()) {
+            windows[i].unminimize();
+            windows[i].raise();
+          }
+        }
+
+        let current_focus = focusId;
+
+        if (this._scrollCounter < -1 || this._scrollCounter > 1) {
+          focusId += Math.round(this._scrollCounter);
+          if (focusId < 0) {
+            focusId = nw - 1;
+          }
+          if (focusId >= nw) {
+            focusId = 0;
+          }
+          this._scrollCounter = 0;
+        }
+
+        if (current_focus == focusId) return;
+      } else if (nw == 1) {
+        if (windows[0].is_hidden()) {
+          windows[0].unminimize();
+          windows[0].raise();
+        }
+      }
+
+      let window = windows[focusId];
+      if (window) {
+        this._lockCycle();
+        this._raiseAndFocus(window);
+      }
+    }
+  }
+);
