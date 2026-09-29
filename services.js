@@ -10,6 +10,7 @@ import Graphene from 'gi://Graphene';
 
 import { Clock } from './apps/clock.js';
 import { Calendar } from './apps/calendar.js';
+import { isImageType, makeThumbnail } from './downloadThumb.js';
 
 // sync with animator
 const CANVAS_SIZE = 120;
@@ -123,6 +124,14 @@ export const Services = class {
   }
 
   disable() {
+    if (this._thumbFile) {
+      try {
+        Gio.File.new_for_path(this._thumbFile).delete(null);
+      } catch (e) {
+        // already gone
+      }
+      this._thumbFile = null;
+    }
     this._downloadsMonitor.disconnectObject(this);
     this._downloadsMonitor = null;
     this._services = [];
@@ -670,6 +679,73 @@ export const Services = class {
     } catch (err) {
       console.log(err);
     }
+    this._updateDownloadsIcon();
+  }
+
+  // The downloads icon shows what was actually downloaded, but only things
+  // that arrived after login; until then it stays the plain folder. Images get
+  // a rendered thumbnail, everything else the icon-pack icon for its type.
+  // Only the dock renderer reads these -- the popup list is untouched.
+  // The dock only repaints while animating, so a changed icon would sit
+  // unseen until the next hover; wake it up.
+  _redrawDocks() {
+    this.extension.docks?.forEach((d) => d._beginAnimation());
+  }
+
+  _updateDownloadsIcon() {
+    if (this._downloadsSince === undefined)
+      this._downloadsSince = Math.floor(GLib.get_real_time() / 1e6);
+
+    const partial = /\.(crdownload|part|download|opdownload|tmp|partial)$/i;
+    const latest = (this._downloadFiles || []).find(
+      (f) =>
+        !f.name.startsWith('.') &&
+        !partial.test(f.name) &&
+        (f.date?.tv_sec || 0) >= this._downloadsSince
+    );
+
+    if (!latest) {
+      this._downloadShown = null;
+      this.downloadIconName = null;
+      this.downloadGicon = null;
+      this._redrawDocks();
+      return;
+    }
+
+    const key = `${latest.path}|${latest.date.tv_sec}`;
+    if (key === this._downloadShown) return;
+    this._downloadShown = key;
+
+    if (!isImageType(latest.type)) {
+      this.downloadIconName = latest.icon;
+      this.downloadGicon = null;
+      this._redrawDocks();
+      return;
+    }
+
+    // keep showing the previous icon until the new thumbnail is ready
+    const out = tempPath(`download-thumb-${(this._thumbSeq = (this._thumbSeq || 0) + 1)}.png`);
+    makeThumbnail(latest.path, out).then((ok) => {
+      if (this._downloadShown !== key) return;
+      if (!ok) {
+        this.downloadIconName = latest.icon;
+        this.downloadGicon = null;
+        this._redrawDocks();
+        return;
+      }
+      const old = this._thumbFile;
+      this._thumbFile = out;
+      this.downloadIconName = null;
+      this.downloadGicon = new Gio.FileIcon({ file: Gio.File.new_for_path(out) });
+      this._redrawDocks();
+      if (old) {
+        try {
+          Gio.File.new_for_path(old).delete(null);
+        } catch (e) {
+          // already gone
+        }
+      }
+    });
   }
 
   _debounceCheckDownloads() {

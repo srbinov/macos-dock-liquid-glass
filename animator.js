@@ -28,6 +28,8 @@ import {
 
 const ANIM_POSITION_PER_SEC = 550 / 1000;
 const ANIM_SIZE_PER_SEC = 250 / 1000;
+// downloads icon size relative to other dock icons
+const DOWNLOADS_ICON_SCALE = 0.8;
 const ANIM_ICON_RAISE = 0.5;
 const ANIM_ICON_SCALE = 1.5;
 const ANIM_ICON_HIT_AREA = 2.5;
@@ -643,7 +645,18 @@ export let Animator = class {
         }
 
         let renderer = icon._renderer;
-        if (gicon) {
+        // downloads icon shows the latest download (see services.js)
+        const dlServices = dock.extension.services;
+        if (icon === dock._downloadsIcon && dlServices) {
+          if (dlServices.downloadGicon) {
+            gicon = dlServices.downloadGicon;
+          } else if (dlServices.downloadIconName) {
+            icon_name = dlServices.downloadIconName;
+          }
+        }
+        if (gicon && icon === dock._downloadsIcon) {
+          if (renderer.gicon !== gicon) renderer.gicon = gicon;
+        } else if (gicon) {
           // apply override
           renderer.gicon = gicon;
 
@@ -682,7 +695,12 @@ export let Animator = class {
         //-------------------
         let unscaledIconSize = dock._iconSizeScaledDown * scaleFactor;
         let targetSize = unscaledIconSize * icon._targetScale;
-        let currentSize = renderer.icon_size * renderer.scaleX;
+        // only a shown download shrinks; the plain folder keeps full size
+        const showingDownload =
+          icon === dock._downloadsIcon &&
+          !!(dlServices?.downloadGicon || dlServices?.downloadIconName);
+        const shrink = showingDownload ? DOWNLOADS_ICON_SCALE : 1;
+        let currentSize = (renderer.icon_size * renderer.scaleX) / shrink;
         {
           let dst = targetSize - currentSize;
           let mag = Math.abs(dst);
@@ -708,7 +726,9 @@ export let Animator = class {
           renderer.set_icon_size(baseSize);
         }
         let scaleToTarget = targetSize / baseSize;
-        renderer.set_scale(scaleToTarget, scaleToTarget);
+        // the downloads icon (folder, thumbnail or file-type icon) sits
+        // smaller than app icons, like macOS
+        renderer.set_scale(scaleToTarget * shrink, scaleToTarget * shrink);
 
         // Gap opened up by user separators to this icon's left. Applied as a
         // post-layout translation on the ghost container itself (not just the
@@ -754,9 +774,11 @@ export let Animator = class {
             }
 
             let ry = p[1] + adjustY + icon._icon.translationY - renderOffset[1];
+            // keep the shrunken icon centred in its slot
+            let inset = (targetSize * (1 - shrink)) / 2;
             renderer.set_position(
-              p[0] + adjustX + icon._icon.translationX - renderOffset[0],
-              ry
+              p[0] + adjustX + icon._icon.translationX - renderOffset[0] + inset,
+              ry + inset
             );
 
             // renderer.ease({
